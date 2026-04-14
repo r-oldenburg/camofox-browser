@@ -51,6 +51,7 @@ function log(level, msg, fields = {}) {
 }
 
 const app = express();
+app.set('json spaces', 2);
 app.use(express.json({ limit: '100kb' }));
 
 // Request logging + metrics middleware
@@ -242,6 +243,51 @@ app.post('/sessions/:userId/cookies', express.json({ limit: '512kb' }), async (r
   } catch (err) {
     failuresTotal.labels(classifyError(err), 'set_cookies').inc();
     log('error', 'cookie import failed', { reqId: req.reqId, error: err.message });
+    res.status(500).json({ error: safeError(err) });
+  }
+});
+
+// Export cookies
+app.get('/sessions/:userId/cookies', async (req, res) => {
+  try {
+    if (CONFIG.apiKey) {
+      const apiKey = CONFIG.apiKey;
+      const auth = String(req.headers['authorization'] || '');
+      const match = auth.match(/^Bearer\s+(.+)$/i);
+      if (!match || !timingSafeCompare(match[1], apiKey)) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+    } else {
+      const remoteAddress = req.socket?.remoteAddress || '';
+      const allowUnauthedLocal = CONFIG.nodeEnv !== 'production' && isLoopbackAddress(remoteAddress);
+      if (!allowUnauthedLocal) {
+        return res.status(403).json({
+          error: 'Cookie export is disabled without CAMOFOX_API_KEY except for loopback requests in non-production environments.',
+        });
+      }
+    }
+
+    const userId = req.params.userId;
+    const session = sessions.get(normalizeUserId(userId));
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+
+    const { url, pattern } = req.query;
+    let cookies = await session.context.cookies(url || undefined);
+    
+    if (pattern) {
+      try {
+        const regex = new RegExp(pattern, 'i');
+        cookies = cookies.filter(c => regex.test(c.name));
+      } catch (e) {
+        log('warn', 'invalid cookie pattern', { pattern, error: e.message });
+        return res.status(400).json({ error: `Invalid pattern: ${e.message}` });
+      }
+    }
+
+    log('info', 'cookies exported', { reqId: req.reqId, userId: String(userId), count: cookies.length, pattern });
+    res.json(cookies);
+  } catch (err) {
+    log('error', 'cookie export failed', { reqId: req.reqId, error: err.message });
     res.status(500).json({ error: safeError(err) });
   }
 });
@@ -2282,6 +2328,33 @@ app.post('/tabs/:tabId/scroll', async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     log('error', 'scroll failed', { reqId: req.reqId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
+// Eval
+app.post('/tabs/:tabId/eval', async (req, res) => {
+  const tabId = req.params.tabId;
+  try {
+    const { userId, expression } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    if (!expression) return res.status(400).json({ error: 'expression required' });
+    
+    const session = sessions.get(normalizeUserId(userId));
+    const found = session && findTab(session, tabId);
+    if (!found) return res.status(404).json({ error: 'Tab not found' });
+    
+    const { tabState } = found;
+    tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
+    
+    const result = await withUserLimit(userId, () => withTabLock(tabId, async () => {
+      return await tabState.page.evaluate(expression);
+    }, requestTimeoutMs()));
+    
+    log('info', 'eval', { reqId: req.reqId, tabId, expressionSnippet: expression.slice(0, 100) });
+    res.json(result);
+  } catch (err) {
+    log('error', 'eval failed', { reqId: req.reqId, tabId: req.params.tabId, error: err.message });
     handleRouteError(err, req, res);
   }
 });
