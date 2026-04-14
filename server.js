@@ -974,6 +974,7 @@ function createTabState(page) {
     consecutiveTimeouts: 0,
     lastSnapshot: null,
     lastRequestedUrl: null,
+    lastRequestHeaders: null,
     googleRetryCount: 0,
   };
 }
@@ -1019,7 +1020,8 @@ async function rotateGoogleTab(userId, sessionKey, tabId, previousTabState, reas
   await withPageLoadDuration('navigate', () => page.goto('https://www.google.com/', { waitUntil: 'domcontentloaded', timeout: 30000 }));
   tabState.visitedUrls.add('https://www.google.com/');
   await page.waitForTimeout(1200);
-  await withPageLoadDuration('navigate', () => page.goto(tabState.lastRequestedUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }));
+  const response = await withPageLoadDuration('navigate', () => page.goto(tabState.lastRequestedUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }));
+  if (response) tabState.lastRequestHeaders = response.request().headers();
   tabState.visitedUrls.add(tabState.lastRequestedUrl);
   return { session, tabState };
 }
@@ -1751,7 +1753,8 @@ app.post('/tabs', async (req, res) => {
         const urlErr = validateUrl(url);
         if (urlErr) throw Object.assign(new Error(urlErr), { statusCode: 400 });
         tabState.lastRequestedUrl = url;
-        await withPageLoadDuration('open_url', () => page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }));
+        const response = await withPageLoadDuration('open_url', () => page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }));
+        if (response) tabState.lastRequestHeaders = response.request().headers();
         tabState.visitedUrls.add(url);
       }
       
@@ -1822,7 +1825,8 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
 
         const navigateCurrentPage = async () => {
           tabState.lastRequestedUrl = targetUrl;
-          await withPageLoadDuration('navigate', () => tabState.page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }));
+          const response = await withPageLoadDuration('navigate', () => tabState.page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }));
+          if (response) tabState.lastRequestHeaders = response.request().headers();
           tabState.visitedUrls.add(targetUrl);
           tabState.lastSnapshot = null;
         };
@@ -2355,6 +2359,26 @@ app.post('/tabs/:tabId/eval', async (req, res) => {
     res.json(result);
   } catch (err) {
     log('error', 'eval failed', { reqId: req.reqId, tabId: req.params.tabId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
+// Headers
+app.get('/tabs/:tabId/headers', async (req, res) => {
+  const tabId = req.params.tabId;
+  try {
+    const userId = req.body?.userId || req.query?.userId;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    
+    const session = sessions.get(normalizeUserId(userId));
+    const found = session && findTab(session, tabId);
+    if (!found) return res.status(404).json({ error: 'Tab not found' });
+    
+    const { tabState } = found;
+    log('info', 'get_headers', { reqId: req.reqId, tabId, userId });
+    res.json(tabState.lastRequestHeaders || {});
+  } catch (err) {
+    log('error', 'get_headers failed', { reqId: req.reqId, tabId: req.params.tabId, error: err.message });
     handleRouteError(err, req, res);
   }
 });
