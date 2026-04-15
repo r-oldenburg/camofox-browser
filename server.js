@@ -975,8 +975,35 @@ function createTabState(page) {
     lastSnapshot: null,
     lastRequestedUrl: null,
     lastRequestHeaders: null,
+    lastXhrHeaders: null,
+    lastXhrUrl: null,
     googleRetryCount: 0,
   };
+}
+
+function attachRequestListeners(tabState) {
+  tabState.page.on('request', request => {
+    const type = request.resourceType();
+    if (type === 'xhr' || type === 'fetch') {
+      try {
+        const pageUrl = tabState.page.url();
+        if (!pageUrl || pageUrl === 'about:blank') return;
+        
+        const pageHost = new URL(pageUrl).hostname;
+        const requestHost = new URL(request.url()).hostname;
+        
+        // Match if request hostname matches or is a subdomain of the page hostname
+        // (e.g. api.immowelt.de matches www.immowelt.de)
+        const basePageHost = pageHost.replace(/^www\./, '');
+        if (requestHost === pageHost || requestHost.endsWith('.' + basePageHost)) {
+          tabState.lastXhrHeaders = request.headers();
+          tabState.lastXhrUrl = request.url();
+        }
+      } catch (err) {
+        // Ignore URL parsing errors
+      }
+    }
+  });
 }
 
 async function isGoogleUnavailable(page) {
@@ -1003,6 +1030,7 @@ async function rotateGoogleTab(userId, sessionKey, tabId, previousTabState, reas
   const group = getTabGroup(session, sessionKey);
   const page = await session.context.newPage();
   const tabState = createTabState(page);
+  attachRequestListeners(tabState);
   tabState.googleRetryCount = (previousTabState.googleRetryCount || 0) + 1;
   tabState.lastRequestedUrl = previousTabState.lastRequestedUrl;
   attachDownloadListener(tabState, tabId, log);
@@ -1745,6 +1773,7 @@ app.post('/tabs', async (req, res) => {
       const page = await session.context.newPage();
       const tabId = fly.makeTabId();
       const tabState = createTabState(page);
+      attachRequestListeners(tabState);
       attachDownloadListener(tabState, tabId);
       group.set(tabId, tabState);
       refreshActiveTabsGauge();
@@ -1798,6 +1827,7 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
         {
           const page = await session.context.newPage();
           tabState = createTabState(page);
+          attachRequestListeners(tabState);
           attachDownloadListener(tabState, tabId, log);
           const group = getTabGroup(session, resolvedSessionKey);
           group.set(tabId, tabState);
@@ -1853,6 +1883,7 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
           const group = getTabGroup(session, currentSessionKey);
           const page = await session.context.newPage();
           tabState = createTabState(page);
+          attachRequestListeners(tabState);
           tabState.googleRetryCount = previousRetryCount + 1;
           attachDownloadListener(tabState, tabId, log);
           group.set(tabId, tabState);
@@ -2383,6 +2414,29 @@ app.get('/tabs/:tabId/headers', async (req, res) => {
   }
 });
 
+// XHR Headers
+app.get('/tabs/:tabId/xhr-headers', async (req, res) => {
+  const tabId = req.params.tabId;
+  try {
+    const userId = req.body?.userId || req.query?.userId;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    
+    const session = sessions.get(normalizeUserId(userId));
+    const found = session && findTab(session, tabId);
+    if (!found) return res.status(404).json({ error: 'Tab not found' });
+    
+    const { tabState } = found;
+    log('info', 'get_xhr_headers', { reqId: req.reqId, tabId, userId });
+    res.json({
+      url: tabState.lastXhrUrl || null,
+      headers: tabState.lastXhrHeaders || {}
+    });
+  } catch (err) {
+    log('error', 'get_xhr_headers failed', { reqId: req.reqId, tabId: req.params.tabId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
 // Back
 app.post('/tabs/:tabId/back', async (req, res) => {
   const tabId = req.params.tabId;
@@ -2864,6 +2918,7 @@ app.post('/tabs/open', async (req, res) => {
     const page = await session.context.newPage();
     const tabId = fly.makeTabId();
     const tabState = createTabState(page);
+    attachRequestListeners(tabState);
     attachDownloadListener(tabState, tabId, log);
     group.set(tabId, tabState);
     refreshActiveTabsGauge();
