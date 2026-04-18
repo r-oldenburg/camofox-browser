@@ -51,8 +51,8 @@ RUN --mount=type=bind,source=dist,target=/dist \
     && test -f /root/.cache/camoufox/camoufox-bin && echo "Camoufox installed successfully"
 
 # Install yt-dlp for YouTube transcript extraction (no browser needed)
-RUN --mount=type=bind,source=dist,target=/dist \
-    install -m 755 /dist/yt-dlp-${ARCH} /usr/local/bin/yt-dlp
+#RUN --mount=type=bind,source=dist,target=/dist \
+#    install -m 755 /dist/yt-dlp-${ARCH} /usr/local/bin/yt-dlp
 
 WORKDIR /app
 
@@ -63,7 +63,8 @@ COPY server.js ./
 COPY lib/ ./lib/
 
 ENV NODE_ENV=production
-ENV CAMOFOX_PORT=3000
+ENV CAMOFOX_PORT=9377
+ENV PORT=9377
 
 EXPOSE 9377
 
