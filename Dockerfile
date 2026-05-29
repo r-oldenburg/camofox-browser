@@ -1,4 +1,4 @@
-FROM node:20-slim
+FROM node:22-slim
 
 # Pinned Camoufox version for reproducible builds
 # Update these when upgrading Camoufox
@@ -36,7 +36,10 @@ RUN apt-get update && apt-get install -y \
     fontconfig \
     # Utils
     ca-certificates \
+    curl \
     unzip \
+    # init process to reap zombies and forward signals
+    tini \
     # yt-dlp runtime dependency
     python3-minimal \
     && rm -rf /var/lib/apt/lists/*
@@ -65,7 +68,15 @@ COPY lib/ ./lib/
 ENV NODE_ENV=production
 ENV CAMOFOX_PORT=9377
 ENV PORT=9377
+ENV PROXY_HOST=localhost
+ENV PROXY_PORT=8000
 
 EXPOSE 9377
 
-CMD ["sh", "-c", "node --max-old-space-size=${MAX_OLD_SPACE_SIZE:-128} server.js"]
+RUN curl -sL https://github.com/Diniboy1123/usque/releases/download/v3.0.0/usque_3.0.0_linux_arm64.zip  -o "/tmp/usque.zip"  \
+    && unzip /tmp/usque.zip usque -d /usr/bin/ \
+    && chmod +x /usr/bin/usque
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+
+CMD ["sh", "-c", "usque register -a && usque http-proxy & exec node --max-old-space-size=${MAX_OLD_SPACE_SIZE:-128} server.js"]
