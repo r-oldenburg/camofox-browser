@@ -4,6 +4,7 @@ import { firefox } from 'playwright-core';
 import express from 'express';
 import crypto from 'crypto';
 import os from 'os';
+import fs from 'fs';
 import { expandMacro } from './lib/macros.js';
 import { loadConfig } from './lib/config.js';
 import { normalizePlaywrightProxy, createProxyPool, buildProxyUrl } from './lib/proxy.js';
@@ -654,6 +655,17 @@ async function launchBrowserInstance() {
         virtual_display: vdDisplay,
       });
       options.proxy = normalizePlaywrightProxy(options.proxy);
+
+      // Lambda: disable multiprocess if /dev/shm is missing (Firefox IPC needs it)
+      if (!fs.existsSync('/dev/shm')) {
+        log('info', 'no /dev/shm detected, disabling e10s/fission for single-process mode');
+        options.firefoxUserPrefs = {
+          ...(options.firefoxUserPrefs || {}),
+          'browser.tabs.remote.autostart': false,
+          'browser.tabs.remote.autostart.2': false,
+          'fission.autostart': false,
+        };
+      }
 
       candidateBrowser = await firefox.launch(options);
 
