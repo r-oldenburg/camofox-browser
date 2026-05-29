@@ -2300,14 +2300,24 @@ app.post('/tabs/:tabId/solve-captcha', async (req, res) => {
       log('info', 'solve-captcha: found captcha iframe', { url: captchaFrame.url() });
 
       // 2. Wait for slider elements to appear
+      let sliderFound = false;
       try {
-        await captchaFrame.waitForSelector('.slider', { timeout: 5000 });
+        await captchaFrame.waitForSelector('.slider, #slider, [class*="slider"], .captcha__slider, #captcha-container', { timeout: 10000 });
+        sliderFound = true;
       } catch (e) {
-        return { solved: false, reason: 'slider element not found within 5s' };
+        // Try to get what's actually in the frame
+        let frameContent = '';
+        try {
+          frameContent = await captchaFrame.evaluate(() => document.body ? document.body.innerHTML.slice(0, 2000) : 'no body');
+        } catch (evalErr) {
+          frameContent = `eval failed: ${evalErr.message}`;
+        }
+        log('warn', 'solve-captcha: slider not found, frame content sample', { frameContent: frameContent.slice(0, 500) });
+        return { solved: false, reason: 'slider element not found within 10s', frameContent: frameContent.slice(0, 2000) };
       }
 
       // 3. Get bounding boxes of slider handle and target
-      const slider = captchaFrame.locator('.slider');
+      const slider = captchaFrame.locator('.slider, #slider, [class*="slider"]:not([class*="container"])').first();
       const sliderBox = await slider.boundingBox();
       if (!sliderBox) {
         return { solved: false, reason: 'slider has no bounding box (not visible)' };
