@@ -2275,6 +2275,146 @@ app.post('/tabs/:tabId/click', async (req, res) => {
   }
 });
 
+// Solve Datadome slider CAPTCHA
+app.post('/tabs/:tabId/solve-captcha', async (req, res) => {
+  const tabId = req.params.tabId;
+  try {
+    const { userId } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const session = sessions.get(normalizeUserId(userId));
+    const found = session && findTab(session, tabId);
+    if (!found) return res.status(404).json({ error: 'Tab not found' });
+
+    const { tabState } = found;
+    tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
+
+    const result = await withUserLimit(userId, () => withTabLock(tabId, async () => {
+      const page = tabState.page;
+
+      // 1. Find the captcha iframe (geo.captcha-delivery.com)
+      const frames = page.frames();
+      const captchaFrame = frames.find(f => f.url().includes('captcha-delivery') || f.url().includes('datadome'));
+      if (!captchaFrame) {
+        return { solved: false, reason: 'no captcha iframe found', frameUrls: frames.map(f => f.url()) };
+      }
+      log('info', 'solve-captcha: found captcha iframe', { url: captchaFrame.url() });
+
+      // 2. Wait for slider elements to appear
+      try {
+        await captchaFrame.waitForSelector('.slider', { timeout: 5000 });
+      } catch (e) {
+        return { solved: false, reason: 'slider element not found within 5s' };
+      }
+
+      // 3. Get bounding boxes of slider handle and target
+      const slider = captchaFrame.locator('.slider');
+      const sliderBox = await slider.boundingBox();
+      if (!sliderBox) {
+        return { solved: false, reason: 'slider has no bounding box (not visible)' };
+      }
+
+      // Try .sliderTarget first, fall back to computing target from track width
+      let endX;
+      const target = captchaFrame.locator('.sliderTarget');
+      const targetBox = await target.boundingBox().catch(() => null);
+      if (targetBox) {
+        endX = targetBox.x + targetBox.width / 2;
+      } else {
+        // Fallback: drag to the right edge of the slider track
+        const track = captchaFrame.locator('.sliderContainer, .slider-container, [class*="track"]');
+        const trackBox = await track.first().boundingBox().catch(() => null);
+        if (trackBox) {
+          endX = trackBox.x + trackBox.width - 20;
+        } else {
+          // Last resort: drag 250px to the right
+          endX = sliderBox.x + sliderBox.width / 2 + 250;
+        }
+      }
+
+      const startX = sliderBox.x + sliderBox.width / 2;
+      const startY = sliderBox.y + sliderBox.height / 2;
+      const endY = startY; // horizontal slider
+
+      log('info', 'solve-captcha: coordinates', {
+        startX: startX.toFixed(0), startY: startY.toFixed(0),
+        endX: endX.toFixed(0), endY: endY.toFixed(0),
+        distance: (endX - startX).toFixed(0),
+      });
+
+      // 4. Human-like drag (ported from BrowserEngine)
+      const easeInOutCubic = (t) => t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+      const totalSteps = 28 + Math.floor(Math.random() * 12); // 28-40 steps
+      const totalDuration = 900 + Math.random() * 400; // 900-1300ms
+      const overshootPx = (endX - startX) * (0.04 + Math.random() * 0.04); // 4-8% overshoot
+
+      // Move to start position
+      await page.mouse.move(startX, startY);
+      await page.waitForTimeout(100 + Math.random() * 150);
+
+      // Press
+      await page.mouse.down();
+      await page.waitForTimeout(50 + Math.random() * 80);
+
+      // Drag with easing, overshoot, and wobble
+      for (let i = 1; i <= totalSteps; i++) {
+        const rawT = i / totalSteps;
+        const easedT = easeInOutCubic(rawT);
+
+        // Overshoot in last 15%
+        const overshoot = rawT > 0.85
+          ? overshootPx * Math.sin(((rawT - 0.85) / 0.15) * Math.PI)
+          : 0;
+
+        // Y-axis micro-wobble that diminishes over time
+        const wobbleAmplitude = 1.5 * (1 - easedT);
+        const wobbleY = (Math.random() - 0.5) * 2 * wobbleAmplitude;
+
+        const moveX = Math.round(startX + (endX - startX) * easedT + overshoot);
+        const moveY = Math.round(startY + (endY - startY) * easedT + wobbleY);
+
+        await page.mouse.move(moveX, moveY);
+
+        // Variable delay
+        const speedFactor = 0.4 + 0.6 * (1 - Math.abs(easedT - 0.5) * 2);
+        let stepDelay = totalDuration / totalSteps / speedFactor;
+        // 15% chance of micro-hesitation
+        if (Math.random() < 0.15 && rawT > 0.1 && rawT < 0.85) {
+          stepDelay += 40 + Math.random() * 80;
+        }
+        await page.waitForTimeout(Math.round(stepDelay));
+      }
+
+      // Settle pause then release
+      await page.waitForTimeout(80 + Math.random() * 120);
+      await page.mouse.up();
+
+      log('info', 'solve-captcha: drag completed, waiting for navigation');
+
+      // 5. Wait for page reload (captcha solved → redirect)
+      try {
+        await page.waitForNavigation({ timeout: 15000, waitUntil: 'domcontentloaded' });
+        log('info', 'solve-captcha: page reloaded (success)');
+        return { solved: true };
+      } catch (navErr) {
+        // Check if we're still on captcha page
+        const currentFrames = page.frames();
+        const stillHasCaptcha = currentFrames.some(f => f.url().includes('captcha-delivery'));
+        if (stillHasCaptcha) {
+          return { solved: false, reason: 'drag completed but captcha not solved (no navigation)' };
+        }
+        // Page might have already navigated
+        return { solved: true, note: 'navigation wait timed out but captcha frame gone' };
+      }
+    }, 90000)); // 90s timeout for the entire operation
+
+    log('info', 'solve-captcha result', { reqId: req.reqId, tabId, result });
+    res.json(result);
+  } catch (err) {
+    log('error', 'solve-captcha failed', { reqId: req.reqId, tabId: req.params.tabId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
 // Type
 app.post('/tabs/:tabId/type', async (req, res) => {
   const tabId = req.params.tabId;
